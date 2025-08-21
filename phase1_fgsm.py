@@ -10,7 +10,18 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 from PIL import Image
 import matplotlib.pyplot as plt
-
+# 🔍 --- GPU/CUDA DEBUG INFO ---
+print(f"PyTorch version: {torch.__version__}")
+print(f"CUDA available: {torch.cuda.is_available()}")
+print(f"CUDA version: {torch.version.cuda}")
+print(f"Device count: {torch.cuda.device_count()}")
+if torch.cuda.is_available():
+    print(f"Current device: {torch.cuda.current_device()}")
+    print(f"Device name: {torch.cuda.get_device_name(0)}")
+else:
+    print("⚠️ CUDA is NOT available. Using CPU only.")
+print("-" * 60)  # Visual separator for clean output
+# --- END DEBUG BLOCK ---
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
