@@ -54,19 +54,19 @@ def ensure_imagenet_classes() -> Optional[List[str]]:
             if len(classes) == 1000:
                 return classes
         except Exception as e:
-            print(f"⚠️ Failed to read {local_file}: {e}")
+            print(f"Failed to read {local_file}: {e}")
 
     try:
-        print("📥 Downloading imagenet_classes.txt...")
+        print("Downloading imagenet_classes.txt...")
         urllib.request.urlretrieve(url, local_file)
         with open(local_file, "r", encoding="utf-8") as f:
             classes = [line.strip() for line in f.readlines() if line.strip()]
         if len(classes) == 1000:
             return classes
         else:
-            print(f"⚠️ Downloaded file has {len(classes)} entries, expected 1000.")
+            print(f"Downloaded file has {len(classes)} entries, expected 1000.")
     except Exception as e:
-        print(f"⚠️ Failed to download class names: {e}")
+        print(f"Failed to download class names: {e}")
 
     return None
 
@@ -311,7 +311,7 @@ def run_batch_attack(model: torch.nn.Module,
         try:
             pil_img = load_image(img_path)
         except Exception as e:
-            print(f"⚠️ Skipping {img_path}: {e}")
+            print(f"Skipping {img_path}: {e}")
             continue
 
         defended_pil = apply_defense(pil_img, defense=defense)
@@ -350,7 +350,7 @@ def run_batch_attack(model: torch.nn.Module,
         df.to_csv(csv_path, index=False)
         print(f"Saved batch results to: {csv_path}")
     except PermissionError:
-        print(f"❌ Cannot save: {csv_path} is locked. Close any program using it or change --export_dir.")
+        print(f"ERROR: Cannot save: {csv_path} is locked. Close any program using it or change --export_dir.")
         raise
 
     return df
@@ -402,7 +402,7 @@ def load_model(name: str, device: torch.device):
         else:
             raise ValueError(f"Unsupported model: {name}")
     except Exception as e:
-        print(f"⚠️ Fallback: {e}")
+        print(f"Fallback: {e}")
         if name == "resnet50":
             model = models.resnet50(pretrained=True).to(device).eval()
         elif name == "vgg16":
@@ -506,16 +506,16 @@ def main():
     adv_idx, adv_conf, adv_probs = run_inference_fast(atk_model, adv_input)
     adv_name = categories[adv_idx] if categories and adv_idx < len(categories) else f"class_{adv_idx}"
 
-    print(f"🎯 Original: {orig_name} ({orig_conf:.4f})")
-    print(f"💥 Adversarial: {adv_name} ({adv_conf:.4f})")
-    print(f"✅ Success: {orig_idx != adv_idx}")
+    print(f"Original: {orig_name} ({orig_conf:.4f})")
+    print(f"Adversarial: {adv_name} ({adv_conf:.4f})")
+    print(f"Success: {orig_idx != adv_idx}")
     if orig_idx == adv_idx:
-        print(f"⚠️  Warning: Attack failed. Defense may be working!")
+        print("Warning: Attack failed. Defense may be working!")
     else:
-        print(f"🔥 Success! Model was fooled.")
+        print("Success: Model was fooled.")
 
     metrics = compute_metrics(atk_model, input_tensor, adv_input, orig_idx, norm=args.norm)
-    print(f"[Metrics] success={metrics['success']} | norm={metrics['norm']} | perturbation={metrics['perturbation_norm']:.4f} | Δconf(true)={metrics['confidence_shift']:+.4f}")
+    print(f"[Metrics] success={metrics['success']} | norm={metrics['norm']} | perturbation={metrics['perturbation_norm']:.4f} | dconf_true={metrics['confidence_shift']:+.4f}")
     print_topk(f"{args.model} (adversarial, {args.attack})", adv_probs, args.topk, categories)
 
     visualize(
