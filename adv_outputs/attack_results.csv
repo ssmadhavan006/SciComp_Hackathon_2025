@@ -1,0 +1,6 @@
+original_class,adv_class,success,confidence_shift,perturbation_norm,norm,image,adv_image,original_label_name,adv_label_name
+404,908,1,0.6524852514266968,0.03000009059906006,linf,./images\airplane.jpg,adv_outputs\adv_0.png,airliner,wing
+612,562,1,0.07296050470540649,0.03000009059906006,linf,./images\man_walking.jpg,adv_outputs\adv_1.png,jinrikisha,fountain
+282,287,1,0.6311808527443645,0.030000030994415283,linf,./images\orange_cat.jpg,adv_outputs\adv_2.png,tiger cat,lynx
+817,717,1,0.8893626667559147,0.03000009059906006,linf,./images\sports_car.jpg,adv_outputs\adv_3.png,sports car,pickup
+919,478,1,0.615259051322937,0.03000009059906006,linf,./images\stop_sign.jpg,adv_outputs\adv_4.png,street sign,carton
