@@ -3,25 +3,27 @@ import re
 import sys
 import tempfile
 import subprocess
-from typing import Tuple, Dict, Any, Optional, List
+from typing import Tuple, Dict, Any, Optional
 
 from PIL import Image
 import gradio as gr
-import pandas as pd
 
 
+# Paths
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_PATH = os.path.join(SCRIPT_DIR, "phase1_fgsm.py")
 CWD = SCRIPT_DIR  # Run subprocess here so imagenet_classes.txt and outputs land in project root
 OUTPUT_IMAGE_NAME = "fgsm_result.png"  # produced by phase1_fgsm.py
 
 
+# -------------------------
+# Helpers: CLI mappings
+# -------------------------
 def _label_to_arg_defense(label: str) -> str:
     mapping = {
         "None": "none",
         "Gaussian Blur": "blur",
         "JPEG Compression": "jpeg",
-        "Color Depth Reduction": "color",
         "All": "all",
     }
     return mapping.get(label, "none")
@@ -35,6 +37,9 @@ def _attack_to_arg(name: str) -> str:
     return name.lower()  # FGSM/PGD
 
 
+# -------------------------
+# Helpers: imaging
+# -------------------------
 def _concat_side_by_side(left: Image.Image, right: Image.Image) -> Image.Image:
     # Make same height, keep aspect ratio
     h = max(left.height, right.height)
@@ -43,14 +48,38 @@ def _concat_side_by_side(left: Image.Image, right: Image.Image) -> Image.Image:
         return img.resize((w, target_h))
     L = resize_to_h(left, h)
     R = resize_to_h(right, h)
-    out = Image.new("RGB", (L.width + R.width, h), (255, 255, 255))
+    out = Image.new("RGB", (L.width + R.width, h), (0, 0, 0))
     out.paste(L, (0, 0))
     out.paste(R, (L.width, 0))
     return out
 
 
+def _crop_adv_from_figure(fig_path: str) -> Optional[Image.Image]:
+    """
+    Best-effort: phase1_fgsm.py saves a composite figure (2x2). Crop top-right quadrant for the adversarial image.
+    If cropping fails, return None.
+    """
+    try:
+        with Image.open(fig_path) as fig:
+            w, h = fig.size
+            # top-right quadrant
+            crop_box = (w // 2, 0, w, h // 2)
+            adv_img = fig.crop(crop_box).convert("RGB")
+            return adv_img
+    except Exception:
+        return None
+
+
+# -------------------------
+# Parsing phase1_fgsm.py stdout
+# -------------------------
 def _parse_stdout(stdout: str) -> Dict[str, Any]:
-    # Defaults
+    """
+    Parse lines like:
+      Original: cat (0.9321)
+      Adversarial: dog (0.8743)
+      [Metrics] success=1 | norm=linf | perturbation=0.0300 | dconf_true=-0.4512
+    """
     info = {
         "orig_name": None,
         "orig_conf": None,
@@ -62,11 +91,8 @@ def _parse_stdout(stdout: str) -> Dict[str, Any]:
         "delta_conf_true": None,
     }
 
-    # Accept lines with/without emojis, only matching "Original:" / "Adversarial:"
     orig_re = re.compile(r"Original:\s*(.+?)\s*\(([\d.]+)\)")
     adv_re = re.compile(r"Adversarial:\s*(.+?)\s*\(([\d.]+)\)")
-
-    # Accept both "Δconf(true)" and "dconf_true"; allow scientific notation
     metrics_re = re.compile(
         r"\[Metrics\]\s*success=(\d+)\s*\|\s*norm=([^\|]+)\s*\|\s*perturbation=([0-9.eE+\-]+)\s*\|\s*(?:Δconf\(true\)|dconf_true)=([+\-]?[0-9.eE]+)"
     )
@@ -88,18 +114,19 @@ def _parse_stdout(stdout: str) -> Dict[str, Any]:
     return info
 
 
+# -------------------------
+# Subprocess runner
+# -------------------------
 def _run_phase1(
     image_path: str,
     model: str,
     attack: str,
     epsilon: float,
     defense_label: str,
-    alpha: float,
-    iters: int,
 ) -> Tuple[Optional[str], str]:
     """
-    Runs phase1_fgsm.py and returns (adv_image_path, logs).
-    adv_image_path is None if run failed.
+    Runs phase1_fgsm.py and returns (output_image_path, logs).
+    output_image_path is None if run failed.
     """
     defense_arg = _label_to_arg_defense(defense_label)
     model_arg = _model_to_arg(model)
@@ -116,8 +143,9 @@ def _run_phase1(
         "--topk", "5",
         "--norm", "linf",
     ]
+    # Minimal PGD defaults to keep UI simple
     if attack_arg == "pgd":
-        cmd += ["--alpha", str(alpha), "--iters", str(iters)]
+        cmd += ["--alpha", "0.01", "--iters", "20"]
 
     try:
         proc = subprocess.run(
@@ -126,8 +154,9 @@ def _run_phase1(
             capture_output=True,
             text=True,
             timeout=300,
-            # Force headless plotting and UTF-8 stdio to avoid Unicode errors on Windows
             env={**os.environ, "MPLBACKEND": "Agg", "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8"},
+            encoding="utf-8",
+            errors="replace",
         )
     except subprocess.TimeoutExpired:
         return None, "Error: phase1_fgsm.py timed out."
@@ -138,55 +167,55 @@ def _run_phase1(
     if proc.returncode != 0:
         return None, f"phase1_fgsm.py exited with code {proc.returncode}\n{logs}"
 
-    # Use the figure created by your script; then save a copy as adv_output.png
-    combined_path = os.path.join(CWD, "fgsm_result.png")
-    if not os.path.exists(combined_path):
-        return None, f"Expected output image not found: {combined_path}\n{logs}"
+    out_path = os.path.join(CWD, OUTPUT_IMAGE_NAME)
+    if not os.path.exists(out_path):
+        return None, f"Expected output image not found: {out_path}\n{logs}"
 
-    adv_output = os.path.join(CWD, "adv_output.png")
-    try:
-        with Image.open(combined_path) as im:
-            im.convert("RGB").save(adv_output)
-    except Exception as e:
-        return None, f"Failed to save adv_output.png: {e}\n{logs}"
-
-    return adv_output, logs
+    return out_path, logs
 
 
+# -------------------------
+# Gradio callbacks
+# -------------------------
 def predict_single(
     pil_image: Image.Image,
     model: str,
     attack: str,
     epsilon: float,
     defense: str,
-    alpha: float,
-    iters: int,
-) -> Tuple[Optional[Image.Image], str, str]:
+):
     """
-    Returns: (composite_image, summary_text, logs_text)
+    Returns: (composite_side_by_side, summary_html, logs_text, status_text)
+    Uses yield for smooth loading feedback.
     """
     if pil_image is None:
-        return None, "Please upload an image.", ""
+        yield None, "<div class='summary-card'><h3>Attack Summary</h3><p class='bad'>Please upload an image.</p></div>", "", "❌ Upload an image first."
 
-    # Save input to temp file
     tmp_in = os.path.join(tempfile.gettempdir(), f"in_{next(tempfile._get_candidate_names())}.png")
     pil_image.save(tmp_in)
 
-    adv_path, logs = _run_phase1(tmp_in, model, attack, epsilon, defense, alpha, iters)
-    if adv_path is None:
-        # Return no image, a user-friendly summary, and the raw logs
-        return None, "<div class='summary-card'><h3>Attack Summary</h3><p class='bad'>Attack failed to run. See logs below.</p></div>", logs
+    # Step 1: Running attack
+    yield None, "<div class='summary-card'><h3>Attack Summary</h3><p>🔄 Running attack...</p></div>", "", "🔄 Running attack..."
 
-    try:
-        adv_img = Image.open(adv_path).convert("RGB")
-    except Exception as e:
-        return None, f"<div class='summary-card'><h3>Attack Summary</h3><p class='bad'>Failed to open adversarial image: {e}</p></div>", logs
+    # Step 2: Run the actual attack
+    out_path, logs = _run_phase1(tmp_in, model, attack, epsilon, defense)
 
+    if out_path is None:
+        yield None, "<div class='summary-card'><h3>Attack Summary</h3><p class='bad'>❌ Attack failed. See logs.</p></div>", logs, "❌ Attack failed."
+        return
+
+    # Step 3: Processing result
+    yield None, "<div class='summary-card'><h3>Attack Summary</h3><p>🎨 Processing adversarial image...</p></div>", logs, "🎨 Processing results..."
+
+    adv_only = _crop_adv_from_figure(out_path) or Image.open(out_path).convert("RGB")
+    composite = _concat_side_by_side(pil_image.convert("RGB"), adv_only)
+
+    # Step 4: Final result
     info = _parse_stdout(logs)
     success = info.get("success")
-    success_emoji = "✅" if success else "❌" if success is not None else "❓"
-    success_class = "ok" if success else "bad" if success is not None else ""
-    # Build dark styled summary card (HTML)
+    success_emoji = "✅" if success else "❌"
+    success_class = "ok" if success else "bad"
+
     summary_html = f"""
     <div class="summary-card">
       <h3>Attack Summary</h3>
@@ -195,120 +224,259 @@ def predict_single(
         <li>Attack: <strong>{attack}</strong> | ε=<strong>{epsilon:.3f}</strong> | Defense: <strong>{defense}</strong></li>
         <li>Original: <strong>{info.get('orig_name', '?')}</strong> ({info.get('orig_conf', '?')})</li>
         <li>Adversarial: <strong>{info.get('adv_name', '?')}</strong> ({info.get('adv_conf', '?')})</li>
-        <li class="{success_class}">Success: <strong>{success_emoji}</strong> | Perturbation: <strong>{info.get('perturbation', '?')}</strong> ({info.get('norm', '?')}) | Δconf(true)=<strong>{info.get('delta_conf_true', '?')}</strong></li>
+        <li class="{success_class}">Success: <strong>{success_emoji}</strong> | Perturbation: <strong>{info.get('perturbation', '?')}</strong> (linf) | Confidence drop=<strong>{info.get('delta_conf_true', '?')}</strong></li>
       </ul>
     </div>
     """
 
-    return adv_img, summary_html, logs
+    yield composite, summary_html, logs, "✅ Attack completed!"
 
 
-def benchmark_models(
-    pil_image: Image.Image,
-    attack: str,
-    epsilon: float,
-    defense: str,
-    alpha: float,
-    iters: int,
-) -> Tuple[pd.DataFrame, str]:
+def benchmark_models(pil_image: Image.Image):
     """
-    Runs the same attack across ResNet50, VGG16, DenseNet121, returns a dataframe and combined logs.
+    Runs attack on all 3 models and returns vulnerability ranking artifacts.
+    Outputs (in order):
+    - bench_rank_md: Markdown title for ranking
+    - bench_table: Dataframe with rank, model, success, confidence drop, vulnerability score, perturbation
+    - bench_winner_md: Markdown for the most robust model
+    - bench_summary_html: HTML summary card with most vulnerable/robust and tips
+    - bench_logs: Text logs (progress + raw logs)
     """
     if pil_image is None:
-        return pd.DataFrame(columns=["Model", "Success?", "Confidence Drop", "Perturbation", "Norm"]), "Please upload an image."
+        yield "### 🔍 Vulnerability Ranking", [], "**No image provided**", "<div class='summary-card'><h3>📊 Robustness Analysis</h3><p>Please upload an image.</p></div>", "Please upload an image."
+        return
 
     models = ["ResNet50", "VGG16", "DenseNet121"]
-    rows = []
-    all_logs = []
-
     tmp_in = os.path.join(tempfile.gettempdir(), f"in_{next(tempfile._get_candidate_names())}.png")
     pil_image.save(tmp_in)
 
-    for m in models:
-        adv_path, logs = _run_phase1(tmp_in, m, attack, epsilon, defense, alpha, iters)
-        all_logs.append(f"--- {m} ---\n{logs}")
-        info = _parse_stdout(logs)
-        rows.append({
-            "Model": m,
-            "Success?": "✅" if info.get("success") else "❌",
-            "Confidence Drop": info.get("delta_conf_true"),
-            "Perturbation": info.get("perturbation"),
+    results = []
+    logs_accum = []
+
+    # Initial UI update
+    yield "### 🔍 Vulnerability Ranking", [], "", "<div class='summary-card'><h3>📊 Robustness Analysis</h3><p>Running benchmark...</p></div>", "⏳ Starting benchmark..."
+
+    for i, m in enumerate(models):
+        out_path, logs = _run_phase1(tmp_in, m, "pgd", 0.05, "none")
+        logs_accum.append(f"--- {m} ---\n{logs if logs else ''}")
+        info = _parse_stdout(logs or "")
+
+        success = info.get("success")
+        drop = info.get("delta_conf_true")
+        pert = info.get("perturbation")
+
+        # Error handling: if run failed or metrics missing, mark as failed but keep ranking going
+        failed_run = (out_path is None)
+        if failed_run or success is None or drop is None:
+            success = False if success is None else success
+            drop = 0.0 if drop is None else drop
+            status_str = "Failed" if failed_run else ("✅" if success else "❌")
+            logs_accum.append("⚠️ Attack run failed or incomplete metrics; treating as failure for ranking.")
+        else:
+            status_str = "✅" if success else "❌"
+
+        # Vulnerability score: (1.0 if success else 0.5) * abs(delta_conf_true)
+        score = (1.0 if success else 0.5) * abs(drop if isinstance(drop, (int, float)) else 0.0)
+
+        results.append({
+            "model": m,
+            "success": success,
+            "status_str": status_str,
+            "drop": drop,
+            "pert": pert,
+            "score": score
         })
 
-    df = pd.DataFrame(rows, columns=["Model", "Success?", "Confidence Drop", "Perturbation"])
-    return df, "\n\n".join(all_logs)
+        # Build partial ranking (descending by vulnerability score)
+        sr = sorted(results, key=lambda r: (r["score"] if r["score"] is not None else -1), reverse=True)
+        medals = ["🥇", "🥈", "🥉"]
+        table_rows = []
+        for idx, r in enumerate(sr):
+            rank_icon = medals[idx] if idx < len(medals) else f"{idx+1}"
+            table_rows.append({
+                "Rank": rank_icon,
+                "Model": r["model"],
+                "Attack Success": r["status_str"],
+                "Confidence Drop": f"{r['drop']:+.4f}" if isinstance(r["drop"], (int, float)) else "n/a",
+                "Vulnerability Score": f"{r['score']:.3f}" if isinstance(r["score"], (int, float)) else "n/a",
+                "Perturbation": f"{r['pert']:.4f}" if isinstance(r["pert"], (int, float)) else "n/a"
+            })
 
+        progress_msg = f"✅ {m} completed ({i+1}/{len(models)})."
+        yield "### 🔍 Vulnerability Ranking", table_rows, "", "<div class='summary-card'><h3>📊 Robustness Analysis</h3><p>📈 Updating ranking...</p></div>", "\n".join(logs_accum + [progress_msg])
 
+    # Final ranking
+    sr = sorted(results, key=lambda r: (r["score"] if r["score"] is not None else -1), reverse=True)
+    medals = ["🥇", "🥈", "🥉"]
+    final_rows = []
+    for idx, r in enumerate(sr):
+        rank_icon = medals[idx] if idx < len(medals) else f"{idx+1}"
+        final_rows.append({
+            "Rank": rank_icon,
+            "Model": r["model"],
+            "Attack Success": r["status_str"],
+            "Confidence Drop": f"{r['drop']:+.4f}" if isinstance(r["drop"], (int, float)) else "n/a",
+            "Vulnerability Score": f"{r['score']:.3f}" if isinstance(r["score"], (int, float)) else "n/a",
+            "Perturbation": f"{r['pert']:.4f}" if isinstance(r["pert"], (int, float)) else "n/a"
+        })
+
+    most_vuln = sr[0]["model"] if sr else "n/a"
+    most_robust = sr[-1]["model"] if sr else "n/a"
+    winner_md = f"**🏆 Winner (Most Robust): {most_robust}**"
+    summary_html = f"""
+    <div class="summary-card">
+      <h3>📊 Robustness Analysis</h3>
+      <p><strong>Most Vulnerable:</strong> <span style="color:#ef4444">{most_vuln} 🥇</span></p>
+      <p><strong>Most Robust:</strong> <span style="color:#22c55e">{most_robust} 🛡️</span></p>
+      <p><em>Tips: Models with dense connectivity (DenseNet) often resist perturbations better.</em></p>
+    </div>
+    """
+    final_logs = "\n".join(logs_accum + ["📊 Generating final ranking...", f"Most Vulnerable: {most_vuln}", f"Most Robust: {most_robust}"])
+
+    yield "### 🔍 Vulnerability Ranking", final_rows, winner_md, summary_html, final_logs
+    # ... existing code ...
+
+# -------------------------
+# Styling (dark, centered, subtle shadows)
+# -------------------------
 custom_css = """
-:root, .gradio-container { --radius-xl: 14px; }
-.gradio-container, body { background: #0b0f17; color: #e5e7eb; }
-.section { background: #0e1525; border: 1px solid #1f2937; border-radius: 12px; padding: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.35); }
-.summary-card { background: #111827; border: 1px solid #374151; border-radius: 12px; padding: 14px 16px; }
+:root, .gradio-container {
+  --radius-xl: 14px;
+}
+
+body, .gradio-container {
+  background: radial-gradient(1200px 600px at 50% 0%, #0f172a 0%, #0b1221 50%, #0a0f1a 100%);
+  color: #e5e7eb;
+}
+
+.container-center {
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+.section {
+  background: rgba(17, 24, 39, 0.7);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 14px;
+  padding: 16px;
+  box-shadow:
+    0 10px 30px rgba(0, 0, 0, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.02);
+}
+
+.summary-card {
+  background: rgba(15, 23, 42, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.18);
+  border-radius: 12px;
+  padding: 14px 16px;
+}
+
 .summary-card h3 { margin: 4px 0 10px 0; }
 .summary-card ul { margin: 0; padding-left: 16px; }
 .summary-card li { margin: 6px 0; }
-.ok { color: #22c55e; } /* green */
-.bad { color: #ef4444; } /* red */
+
+.ok { color: #22c55e; }
+.bad { color: #ef4444; }
+
+button, .gr-button {
+  background: linear-gradient(180deg, #1f2937 0%, #111827 100%) !important;
+  color: #e5e7eb !important;
+  border: 1px solid rgba(148, 163, 184, 0.28) !important;
+  border-radius: 10px !important;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.35);
+}
+
+.gr-input, .gr-textbox, .gr-dropdown, .gr-slider, .gr-radio, .gr-image {
+  background: rgba(17, 24, 39, 0.55) !important;
+  color: #e5e7eb !important;
+  border-color: rgba(148, 163, 184, 0.25) !important;
+}
+
+footer { display: none; }
+
+/* Better spinner */
+.gr-loading {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 100%;
+}
+
+.gr-spinner {
+  width: 40px;
+  height: 40px;
+  border: 3px solid rgba(255, 255, 255, 0.3);
+  border-top: 3px solid #60a5fa;
+  border-radius: 50%;
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
 """
 
+
+# -------------------------
+# App
+# -------------------------
 with gr.Blocks(title="Adversarial Attack Lab", css=custom_css, theme=gr.themes.Soft(primary_hue="blue", neutral_hue="gray")) as demo:
-    gr.Markdown("### 🛡️ Adversarial Attack Lab")
-    gr.Markdown("_Test how easily AI vision models can be fooled by tiny changes._")
+    with gr.Column(elem_classes=["container-center"]):
+        gr.Markdown("### 🛡️ Adversarial Attack Lab", elem_classes=["title"])
+        gr.Markdown("Test how easily AI vision models can be fooled by tiny changes.", elem_classes=["subtitle"])
 
-    with gr.Tab("Run Attack"):
-        with gr.Row():
-            with gr.Column(scale=1):
-                with gr.Group(elem_classes=["section"]):
-                    inp_img = gr.Image(label="Upload Image", type="pil")
-                    clear_btn = gr.Button("Clear")
-            with gr.Column(scale=1):
-                with gr.Group(elem_classes=["section"]):
-                    model_dd = gr.Dropdown(label="Model", choices=["ResNet50", "VGG16", "DenseNet121"], value="ResNet50")
-                    attack_rd = gr.Radio(label="Attack", choices=["FGSM", "PGD"], value="FGSM")
-                    eps_sl = gr.Slider(label="Epsilon (L∞)", minimum=0.01, maximum=0.10, step=0.01, value=0.03)
-                    defense_rd = gr.Radio(label="Defense", choices=["None", "Gaussian Blur", "JPEG Compression", "Color Depth Reduction", "All"], value="None")
-                    with gr.Accordion("Advanced (PGD)", open=False):
-                        alpha_sl = gr.Slider(label="PGD step size (alpha)", minimum=0.001, maximum=0.05, step=0.001, value=0.01)
-                        iters_sl = gr.Slider(label="PGD iterations", minimum=1, maximum=100, step=1, value=20)
-                    run_btn = gr.Button("Launch Attack", variant="primary")
+        with gr.Tabs():
+            with gr.Tab("Run Attack"):
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        with gr.Group(elem_classes=["section"]):
+                            inp_img = gr.Image(label="Upload Image", type="pil")
+                    with gr.Column(scale=1):
+                        with gr.Group(elem_classes=["section"]):
+                            model_dd = gr.Dropdown(label="Model", choices=["ResNet50", "VGG16", "DenseNet121"], value="ResNet50")
+                            attack_rd = gr.Radio(label="Attack", choices=["FGSM", "PGD"], value="FGSM")
+                            eps_sl = gr.Slider(label="Epsilon (L∞)", minimum=0.01, maximum=0.10, step=0.01, value=0.03)
+                            defense_rd = gr.Radio(
+                                ["None", "Gaussian Blur", "JPEG Compression", "All"],
+                                value="None",
+                                label="Defense"
+                            )
+                            run_btn = gr.Button("Launch Attack", variant="primary")
 
                 with gr.Group(elem_classes=["section"]):
-                    out_img = gr.Image(label="Original (Left) vs Adversarial (Right)", type="pil")
+                    out_img = gr.Image(label="Original vs Adversarial", type="pil")
                     out_summary = gr.HTML(value="<div class='summary-card'><h3>Attack Summary</h3><p>Results will appear here...</p></div>")
-                    out_logs = gr.Textbox(label="Logs", value="", lines=10)
+                    status_text = gr.Textbox(label="Status", value="Ready", interactive=False)
+                    out_logs = gr.Textbox(label="Logs", value="", lines=12)
+                    download_btn = gr.File(label="Download Adversarial Image")
 
-        run_btn.click(
-            predict_single,
-            inputs=[inp_img, model_dd, attack_rd, eps_sl, defense_rd, alpha_sl, iters_sl],
-            outputs=[out_img, out_summary, out_logs],
-        )
+                run_btn.click(
+                    predict_single,
+                    inputs=[inp_img, model_dd, attack_rd, eps_sl, defense_rd],
+                    outputs=[out_img, out_summary, out_logs, status_text],
+                    show_progress=True
+                )
 
-        def _clear():
-            return None, "<div class='summary-card'><h3>Attack Summary</h3><p>Cleared.</p></div>", ""
-        clear_btn.click(_clear, outputs=[inp_img, out_summary, out_logs])
+            # ✅ Benchmark Tab
+            with gr.Tab("Model Robustness Benchmark"):
+                with gr.Row():
+                    with gr.Column():
+                        bench_img = gr.Image(label="Upload Image", type="pil")
+                        bench_btn = gr.Button("Benchmark All Models", variant="primary")
+                    with gr.Column():
+                        bench_rank_md = gr.Markdown("### 🔍 Vulnerability Ranking")
+                        bench_table = gr.Dataframe(headers=["Rank", "Model", "Attack Success", "Confidence Drop", "Vulnerability Score", "Perturbation"], value=[])
+                        bench_winner_md = gr.Markdown("")
+                        bench_summary_html = gr.HTML("<div class='summary-card'><h3>📊 Robustness Analysis</h3><p>Results will appear here...</p></div>")
+                        bench_logs = gr.Textbox(label="Logs", value="", lines=12)
 
-    with gr.Tab("Model Robustness Benchmark"):
-        with gr.Row():
-            with gr.Column(scale=1):
-                with gr.Group(elem_classes=["section"]):
-                    bench_img = gr.Image(label="Upload Image", type="pil")
-                    bench_attack = gr.Radio(label="Attack", choices=["FGSM", "PGD"], value="FGSM")
-                    bench_eps = gr.Slider(label="Epsilon (L∞)", minimum=0.01, maximum=0.10, step=0.01, value=0.03)
-                    bench_defense = gr.Radio(label="Defense", choices=["None", "Gaussian Blur", "JPEG Compression", "Color Depth Reduction", "All"], value="None")
-                    with gr.Accordion("Advanced (PGD)", open=False):
-                        bench_alpha = gr.Slider(label="PGD step size (alpha)", minimum=0.001, maximum=0.05, step=0.001, value=0.01)
-                        bench_iters = gr.Slider(label="PGD iterations", minimum=1, maximum=100, step=1, value=20)
-                    bench_btn = gr.Button("Benchmark All Models", variant="primary")
-            with gr.Column(scale=1):
-                with gr.Group(elem_classes=["section"]):
-                    bench_table = gr.Dataframe(headers=["Model", "Success?", "Confidence Drop", "Perturbation"])
-                    bench_logs = gr.Textbox(label="Logs", value="", lines=12)
-
-        bench_btn.click(
-            benchmark_models,
-            inputs=[bench_img, bench_attack, bench_eps, bench_defense, bench_alpha, bench_iters],
-            outputs=[bench_table, bench_logs],
-        )
+                bench_btn.click(
+                    benchmark_models,
+                    inputs=[bench_img],
+                    outputs=[bench_rank_md, bench_table, bench_winner_md, bench_summary_html, bench_logs],
+                    show_progress=True
+                )
 
 if __name__ == "__main__":
     demo.launch()
