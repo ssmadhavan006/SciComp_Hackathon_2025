@@ -13,7 +13,7 @@ import matplotlib.pyplot as plt
 import pandas as pd
 from torchvision.utils import save_image
 
-# 🔍 --- GPU/CUDA DEBUG INFO ---
+
 print(f"PyTorch version: {torch.__version__}")
 print(f"CUDA available: {torch.cuda.is_available()}")
 print(f"CUDA version: {torch.version.cuda}")
@@ -24,7 +24,6 @@ if torch.cuda.is_available():
 else:
     print("⚠️ CUDA is NOT available. Using CPU only.")
 print("-" * 60)
-# --- END DEBUG BLOCK ---
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -44,7 +43,7 @@ def ensure_imagenet_classes() -> Optional[List[str]]:
     Try to ensure we have human-readable ImageNet class names.
     """
     local_file = "imagenet_classes.txt"
-    # ✅ Fixed: Removed trailing spaces
+    
     url = "https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt"
 
     if os.path.exists(local_file):
@@ -119,10 +118,6 @@ def denormalize(img: torch.Tensor, mean: List[float], std: List[float]) -> torch
     return img * std_t + mean_t
 
 
-# -------------------------------
-# ✅ DEFENSE FUNCTIONS
-# -------------------------------
-
 def apply_gaussian_blur(pil_img: Image.Image, radius: float = 1.0) -> Image.Image:
     """Reduce high-frequency noise (adversarial perturbations)."""
     return pil_img.filter(ImageFilter.GaussianBlur(radius=radius))
@@ -134,12 +129,14 @@ def simulate_jpeg_compression(pil_img: Image.Image, quality: int = 75) -> Image.
     buf = io.BytesIO()
     pil_img.save(buf, format='JPEG', quality=quality)
     buf.seek(0)
-    return Image.open(buf)
+    return Image.open(buf).convert("RGB")
 
 
 def reduce_color_depth(pil_img: Image.Image, levels: int = 64) -> Image.Image:
-    """Feature squeezing: reduce color resolution."""
-    np_img = np.array(pil_img) // (256 // levels) * (256 // levels)
+    """Feature squeezing: reduce color resolution.""" 
+    import numpy as np
+    step = max(1, 256 // max(1, levels))
+    np_img = (np.array(pil_img) // step) * step
     return Image.fromarray(np_img)
 
 
@@ -164,9 +161,6 @@ def apply_defense(pil_img: Image.Image, defense: str = "none") -> Image.Image:
     return pil_img
 
 
-# -------------------------------
-# ✅ FAST INFERENCE (Mixed Precision)
-# -------------------------------
 
 @torch.no_grad()
 def run_inference_fast(model: torch.nn.Module, input_tensor: torch.Tensor) -> Tuple[int, float, torch.Tensor]:
@@ -174,17 +168,14 @@ def run_inference_fast(model: torch.nn.Module, input_tensor: torch.Tensor) -> Tu
     Faster inference using autocast (half precision on CUDA).
     """
     device = input_tensor.device
-    with torch.autocast(device_type=str(device).split(":")[0], enabled=device.type == "cuda"):
+    dtype = "cuda" if device.type == "cuda" else "cpu"
+    with torch.autocast(device_type=dtype, enabled=(dtype == "cuda")):
         output = model(input_tensor)
         probs = F.softmax(output[0], dim=0)
         pred_idx = int(torch.argmax(probs).item())
         pred_conf = float(probs[pred_idx].item())
     return pred_idx, pred_conf, probs
 
-
-# -------------------------------
-# ✅ ATTACKS
-# -------------------------------
 
 def pgd_attack(model: torch.nn.Module,
                image: torch.Tensor,
@@ -197,6 +188,11 @@ def pgd_attack(model: torch.nn.Module,
     device = image.device
     original = image.clone().detach()
     adv = image.clone().detach()
+
+    with torch.no_grad():
+        adv += torch.empty_like(adv).uniform_(-epsilon, epsilon)
+        adv = torch.max(torch.min(adv, original + epsilon), original - epsilon)
+        adv = clamp_normalized(adv, IMAGENET_MEAN, IMAGENET_STD)
 
     for _ in range(iters):
         adv.requires_grad_(True)
@@ -434,7 +430,6 @@ def main():
     parser.add_argument("--labels", type=int, nargs="+", help="True labels for batch images (optional)")
     parser.add_argument("--batch_dir", type=str, help="Directory of images for batch processing")
     parser.add_argument("--export_dir", type=str, default="adv_outputs", help="Output directory for adversarial images and CSV")
-    # ✅ New: Defense
     parser.add_argument("--defense", type=str, default="none", choices=["none", "blur", "jpeg", "color", "all"], help="Apply defense before inference")
 
     args = parser.parse_args()
@@ -442,11 +437,11 @@ def main():
     device = get_device()
     print(f"Using device: {device}")
 
-    # Load model
+    
     atk_model, categories = load_model(args.model, device)
     preprocess = build_preprocess()
 
-    # ==================== BATCH MODE ====================
+    
     if args.images or args.batch_dir:
         image_paths = []
         if args.images:
@@ -479,13 +474,11 @@ def main():
         )
         return
 
-    # ================= SINGLE-IMAGE MODE ================
     if not os.path.exists(args.image):
         raise FileNotFoundError(f"Image not found: {args.image}")
 
     img = load_image(args.image)
 
-    # ✅ Apply defense before preprocessing
     defended_img = apply_defense(img, defense=args.defense)
     input_tensor = preprocess(defended_img).unsqueeze(0).to(device)
 

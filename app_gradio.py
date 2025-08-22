@@ -56,14 +56,14 @@ def _concat_side_by_side(left: Image.Image, right: Image.Image) -> Image.Image:
 
 def _crop_adv_from_figure(fig_path: str) -> Optional[Image.Image]:
     """
-    Best-effort: phase1_fgsm.py saves a composite figure (2x2). Crop top-right quadrant for the adversarial image.
-    If cropping fails, return None.
+    Best-effort: phase1_fgsm.py saves a composite figure (typically 1x2).
+    Crop the right half for the adversarial image. If cropping fails, return None.
     """
     try:
         with Image.open(fig_path) as fig:
             w, h = fig.size
-            # top-right quadrant
-            crop_box = (w // 2, 0, w, h // 2)
+            # right half, full height
+            crop_box = (w // 2, 0, w, h)
             adv_img = fig.crop(crop_box).convert("RGB")
             return adv_img
     except Exception:
@@ -185,52 +185,66 @@ def predict_single(
     defense: str,
 ):
     """
-    Returns: (composite_side_by_side, summary_html, logs_text, status_text)
+    Returns: (composite_side_by_side, summary_html, logs_text, status_text, download_path)
     Uses yield for smooth loading feedback.
     """
     if pil_image is None:
-        yield None, "<div class='summary-card'><h3>Attack Summary</h3><p class='bad'>Please upload an image.</p></div>", "", "❌ Upload an image first."
+        yield None, "<div class='summary-card'><h3>Attack Summary</h3><p class='bad'>Please upload an image.</p></div>", "", "❌ Upload an image first.", None
 
-    tmp_in = os.path.join(tempfile.gettempdir(), f"in_{next(tempfile._get_candidate_names())}.png")
-    pil_image.save(tmp_in)
+    # Safer temp handling for input
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+        tmp_in = f.name
+        pil_image.save(tmp_in)
 
     # Step 1: Running attack
-    yield None, "<div class='summary-card'><h3>Attack Summary</h3><p>🔄 Running attack...</p></div>", "", "🔄 Running attack..."
+    yield None, "<div class='summary-card'><h3>Attack Summary</h3><p>🔄 Running attack...</p></div>", "", "🔄 Running attack...", None
 
-    # Step 2: Run the actual attack
-    out_path, logs = _run_phase1(tmp_in, model, attack, epsilon, defense)
+    try:
+        # Step 2: Run the actual attack
+        out_path, logs = _run_phase1(tmp_in, model, attack, epsilon, defense)
 
-    if out_path is None:
-        yield None, "<div class='summary-card'><h3>Attack Summary</h3><p class='bad'>❌ Attack failed. See logs.</p></div>", logs, "❌ Attack failed."
-        return
+        if out_path is None:
+            yield None, "<div class='summary-card'><h3>Attack Summary</h3><p class='bad'>❌ Attack failed. See logs.</p></div>", logs, "❌ Attack failed.", None
+            return
 
-    # Step 3: Processing result
-    yield None, "<div class='summary-card'><h3>Attack Summary</h3><p>🎨 Processing adversarial image...</p></div>", logs, "🎨 Processing results..."
+        # Step 3: Processing result
+        yield None, "<div class='summary-card'><h3>Attack Summary</h3><p>🎨 Processing adversarial image...</p></div>", logs, "🎨 Processing results...", None
 
-    adv_only = _crop_adv_from_figure(out_path) or Image.open(out_path).convert("RGB")
-    composite = _concat_side_by_side(pil_image.convert("RGB"), adv_only)
+        adv_only = _crop_adv_from_figure(out_path) or Image.open(out_path).convert("RGB")
+        composite = _concat_side_by_side(pil_image.convert("RGB"), adv_only)
 
-    # Step 4: Final result
-    info = _parse_stdout(logs)
-    success = info.get("success")
-    success_emoji = "✅" if success else "❌"
-    success_class = "ok" if success else "bad"
+        # Save downloadable adversarial-only image
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fout:
+            tmp_out = fout.name
+        adv_only.save(tmp_out)
 
-    summary_html = f"""
-    <div class="summary-card">
-      <h3>Attack Summary</h3>
-      <ul>
-        <li>Model: <strong>{model}</strong></li>
-        <li>Attack: <strong>{attack}</strong> | ε=<strong>{epsilon:.3f}</strong> | Defense: <strong>{defense}</strong></li>
-        <li>Original: <strong>{info.get('orig_name', '?')}</strong> ({info.get('orig_conf', '?')})</li>
-        <li>Adversarial: <strong>{info.get('adv_name', '?')}</strong> ({info.get('adv_conf', '?')})</li>
-        <li class="{success_class}">Success: <strong>{success_emoji}</strong> | Perturbation: <strong>{info.get('perturbation', '?')}</strong> (linf) | Confidence drop=<strong>{info.get('delta_conf_true', '?')}</strong></li>
-      </ul>
-    </div>
-    """
+        # Step 4: Final result
+        info = _parse_stdout(logs)
+        success = info.get("success")
+        success_emoji = "✅" if success else "❌"
+        success_class = "ok" if success else "bad"
 
-    yield composite, summary_html, logs, "✅ Attack completed!"
+        summary_html = f"""
+        <div class="summary-card">
+          <h3>Attack Summary</h3>
+          <ul>
+            <li>Model: <strong>{model}</strong></li>
+            <li>Attack: <strong>{attack}</strong> | ε=<strong>{epsilon:.3f}</strong> | Defense: <strong>{defense}</strong></li>
+            <li>Original: <strong>{info.get('orig_name', '?')}</strong> ({info.get('orig_conf', '?')})</li>
+            <li>Adversarial: <strong>{info.get('adv_name', '?')}</strong> ({info.get('adv_conf', '?')})</li>
+            <li class="{success_class}">Success: <strong>{success_emoji}</strong> | Perturbation: <strong>{info.get('perturbation', '?')}</strong> (linf) | Confidence drop=<strong>{info.get('delta_conf_true', '?')}</strong></li>
+          </ul>
+        </div>
+        """
 
+        yield composite, summary_html, logs, "✅ Attack completed!", tmp_out
+    finally:
+        # Clean up input temp file
+        try:
+            os.remove(tmp_in)
+        except OSError:
+            pass
 
 def benchmark_models(pil_image: Image.Image):
     """
@@ -421,9 +435,9 @@ footer { display: none; }
 # -------------------------
 # App
 # -------------------------
-with gr.Blocks(title="Adversarial Attack Lab", css=custom_css, theme=gr.themes.Soft(primary_hue="blue", neutral_hue="gray")) as demo:
+with gr.Blocks(title="VulnerAI", css=custom_css, theme=gr.themes.Soft(primary_hue="blue", neutral_hue="gray")) as demo:
     with gr.Column(elem_classes=["container-center"]):
-        gr.Markdown("### 🛡️ Adversarial Attack Lab", elem_classes=["title"])
+        gr.Markdown("### 🛡️ VulnerAI", elem_classes=["title"])
         gr.Markdown("Test how easily AI vision models can be fooled by tiny changes.", elem_classes=["subtitle"])
 
         with gr.Tabs():
@@ -454,7 +468,7 @@ with gr.Blocks(title="Adversarial Attack Lab", css=custom_css, theme=gr.themes.S
                 run_btn.click(
                     predict_single,
                     inputs=[inp_img, model_dd, attack_rd, eps_sl, defense_rd],
-                    outputs=[out_img, out_summary, out_logs, status_text],
+                    outputs=[out_img, out_summary, out_logs, status_text, download_btn],  # 5 outputs (incl. downloadable file)
                     show_progress=True
                 )
 
