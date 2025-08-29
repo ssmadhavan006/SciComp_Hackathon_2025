@@ -7,14 +7,6 @@ It provides an interactive Gradio UI to run adversarial attacks (FGSM, PGD), app
 
 ---
 
-## 🎥 Quick Demo
-
-![VulnerAI Demo](docs/demo.gif) <sub>*Run FGSM on ResNet50 with epsilon=0.03 → model prediction flips instantly!*</sub>
-
-*(Tip: You can record the GIF using [ScreenToGif](https://www.screentogif.com/) or `asciinema` + `agg` for terminal demos. Save it in `docs/demo.gif` and it will auto-show here.)*
-
----
-
 ## 🚀 Features
 
 * Upload any image and generate adversarial examples.
